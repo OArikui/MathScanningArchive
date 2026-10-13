@@ -1,4 +1,4 @@
-# MathArchive 0.2.0
+# MathArchive 0.2.1
 
 スキャンした数学テストを取り込み、無料 OCR サイトの結果を手動で取り込んで、分類・検索・PDF 出力する Windows 向けデスクトップアプリです。有料 API の契約や API キーは必要ありません。
 
@@ -26,9 +26,11 @@
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python main.py
+.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+.venv\Scripts\python.exe main.py
 ```
+
+**注意：** `requirements.txt` は依存関係の一覧ファイルです。`pip install -e .\requirements.txt` ではなく、必ず `-r` を使ってください。`-e` は開発用の Python パッケージを editable install するときに使うオプションです。
 
 初回インストールでは PySide6 などのパッケージをダウンロードします。アプリの OCR 機能自体には API キーや有料サービスは不要です。
 

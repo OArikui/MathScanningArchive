@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — Fix setup command guidance
+
+- Make the setup script use the absolute requirements.txt path with `pip install -r`.
+- Add a clear error hint for the invalid editable-requirement command (`pip install -e .\requirements.txt`).
+- Check required setup files before installing dependencies.
+- Update the internal package version to 0.2.1.
+- Clarify manual installation commands in the README.
+
+
 ## 0.2.0 — Free manual OCR workflow
 
 - Remove Mathpix API integration and API-key requirements.
