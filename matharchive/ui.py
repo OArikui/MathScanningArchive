@@ -9,17 +9,17 @@ from typing import Any
 
 import fitz
 from PIL import Image, ImageOps
-from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .database import Database
-from .ocr import environment_credentials, recognize_image
+from .ocr import OCR_SITES, build_manual_ocr_payload
 from .pdf_export import PdfExportJob, build_html
 
 
@@ -69,38 +69,119 @@ class ImagePreview(QWidget):
         self.label.setMinimumSize(scaled.size())
 
 
-class CredentialDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None, initial: tuple[str, str] = ("", "")) -> None:
+class FreeOCRDialog(QDialog):
+    """Dialog for free web OCR services and manually pasted recognition text."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        image_path: Path,
+        existing_text: str = "",
+        question_is_empty: bool = True,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Mathpix OCR 設定")
-        self.setMinimumWidth(480)
+        self.setWindowTitle("無料 OCR・結果の取り込み")
+        self.setMinimumSize(720, 660)
+        self.image_path = image_path
+
         layout = QVBoxLayout(self)
-        warning = QLabel(
-            "OCR には Mathpix API を使用します。選択した原本画像は外部サービスへ送信されます。\n"
-            "機密情報・第三者のテストを送信する前に、利用許可とサービスの規約を確認してください。\n"
-            "認証情報はこのセッション中だけ保持し、アプリのデータベースには保存しません。"
+        intro = QLabel(
+            "無料の OCR サイトをブラウザーで開き、原本画像を手動でアップロードしてください。\n"
+            "認識結果をコピーして下の欄に貼り付けると、OCR 結果として保存できます。\n"
+            "このアプリから画像を自動送信する機能や、有料 API の呼び出しはありません。"
         )
-        warning.setWordWrap(True)
-        warning.setStyleSheet("background:#fff5dc;border:1px solid #e9cf8b;padding:10px;border-radius:6px;")
-        layout.addWidget(warning)
-        form = QFormLayout()
-        self.app_id = QLineEdit(initial[0])
-        self.app_id.setPlaceholderText("MATHPIX_APP_ID")
-        self.app_key = QLineEdit(initial[1])
-        self.app_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.app_key.setPlaceholderText("MATHPIX_APP_KEY")
-        form.addRow("App ID", self.app_id)
-        form.addRow("App Key", self.app_key)
-        layout.addLayout(form)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("続行")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("background:#edf6ff;border:1px solid #b7d7f6;padding:10px;border-radius:6px;")
+        layout.addWidget(intro)
+
+        image_row = QHBoxLayout()
+        self.open_image_button = QPushButton("原本画像を開く")
+        self.open_image_button.clicked.connect(self.open_image)
+        self.open_folder_button = QPushButton("原本フォルダーを開く")
+        self.open_folder_button.clicked.connect(self.open_folder)
+        image_row.addWidget(self.open_image_button)
+        image_row.addWidget(self.open_folder_button)
+        image_row.addStretch(1)
+        layout.addLayout(image_row)
+
+        site_group = QWidget()
+        site_layout = QVBoxLayout(site_group)
+        site_layout.setContentsMargins(0, 0, 0, 0)
+        site_layout.addWidget(QLabel("無料 OCR サイト（サイト側の仕様・利用制限は変更される場合があります）"))
+        for site_name, url in OCR_SITES.items():
+            site_button = QPushButton(f"ブラウザーで開く：{site_name}")
+            site_button.setToolTip(url)
+            site_button.clicked.connect(lambda _checked=False, name=site_name, address=url: self.open_site(name, address))
+            site_layout.addWidget(site_button)
+        note = QLabel(
+            "日本語の問題文を含む場合は、まず「Pix2Text 多言語デモ」を試してください。\n"
+            "通常のオンライン版は公式説明上、英語・簡体字中国語向けです。デモは混雑等で遅い場合があります。"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#596273;font-size:9pt;")
+        site_layout.addWidget(note)
+        layout.addWidget(site_group)
+
+        self.service_combo = QComboBox()
+        self.service_combo.addItem("Pix2Text 多言語デモ", "Pix2Text 多言語デモ")
+        self.service_combo.addItem("Pix2Text オンライン版（英語・簡体字中国語向け）", "Pix2Text オンライン版（英語・簡体字中国語向け）")
+        self.service_combo.addItem("その他の OCR サイト", "その他の OCR サイト")
+        self.service_combo.addItem("手入力", "手入力")
+        layout.addWidget(QLabel("使用した OCR サービス"))
+        layout.addWidget(self.service_combo)
+
+        layout.addWidget(QLabel("認識結果（Markdown / LaTeX をそのまま貼り付け可能）"))
+        self.result_edit = QPlainTextEdit()
+        self.result_edit.setPlaceholderText(
+            "無料 OCR サイトの結果をここに貼り付けてください。\n\n"
+            r"例：次の方程式を解きなさい。\n\n\[x^2 - 5x + 6 = 0\]"
+        )
+        self.result_edit.setPlainText(existing_text)
+        layout.addWidget(self.result_edit, 1)
+
+        self.copy_to_question_checkbox = QCheckBox("認識結果を問題本文にもコピーする")
+        self.copy_to_question_checkbox.setChecked(question_is_empty)
+        layout.addWidget(self.copy_to_question_checkbox)
+        privacy = QLabel(
+            "注意：サイトに画像をアップロードすると、その画像は外部サービスに送信されます。"
+            "送信してよい資料か確認してから利用してください。OCR 結果は保存後も「未確認」です。"
+        )
+        privacy.setWordWrap(True)
+        privacy.setStyleSheet("color:#7a4f00;background:#fff5dc;padding:8px;border-radius:5px;")
+        layout.addWidget(privacy)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("OCR 結果を保存")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("キャンセル")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def credentials(self) -> tuple[str, str]:
-        return self.app_id.text().strip(), self.app_key.text().strip()
+    def open_image(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.image_path)))
+
+    def open_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.image_path.parent)))
+
+    def open_site(self, site_name: str, url: str) -> None:
+        self.service_combo.setCurrentText(site_name)
+        QDesktopServices.openUrl(QUrl(url))
+
+    def accept(self) -> None:
+        if not self.recognized_text():
+            QMessageBox.warning(self, "OCR 結果", "認識結果が空です。サイトの結果を貼り付けるか、手入力してください。")
+            self.result_edit.setFocus()
+            return
+        super().accept()
+
+    def recognized_text(self) -> str:
+        return self.result_edit.toPlainText().strip()
+
+    def service_name(self) -> str:
+        return str(self.service_combo.currentData() or "手入力")
+
+    def copy_to_question(self) -> bool:
+        return self.copy_to_question_checkbox.isChecked()
 
 
 class ExportDialog(QDialog):
@@ -136,27 +217,6 @@ class ExportDialog(QDialog):
         return str(self.mode.currentData()), str(self.scope.currentData())
 
 
-class OCRWorker(QThread):
-    succeeded = Signal(int, object)
-    failed = Signal(int, str)
-    status = Signal(str)
-
-    def __init__(self, question_id: int, image_path: Path, app_id: str, app_key: str) -> None:
-        super().__init__()
-        self.question_id = question_id
-        self.image_path = image_path
-        self.app_id = app_id
-        self.app_key = app_key
-
-    def run(self) -> None:
-        self.status.emit("Mathpix OCR を実行中…")
-        try:
-            result = recognize_image(self.image_path, self.app_id, self.app_key)
-            self.succeeded.emit(self.question_id, result)
-        except Exception as exc:
-            self.failed.emit(self.question_id, str(exc))
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -167,9 +227,6 @@ class MainWindow(QMainWindow):
         self.current_id: int | None = None
         self.loaded_record: dict[str, Any] | None = None
         self._loading = False
-        self._credentials = environment_credentials()
-        self._cloud_warning_accepted = False
-        self._worker: OCRWorker | None = None
         self._busy = False
         self._busy_widgets: list[QWidget] = []
         self._pdf_jobs: list[PdfExportJob] = []
@@ -208,8 +265,9 @@ class MainWindow(QMainWindow):
         self.import_button.clicked.connect(self.import_sources)
         self.new_button = QPushButton("＋ 新規問題")
         self.new_button.clicked.connect(self.new_question)
-        self.ocr_button = QPushButton("OCRを実行")
+        self.ocr_button = QPushButton("無料OCR・結果取込")
         self.ocr_button.setObjectName("primary")
+        self.ocr_button.setToolTip("無料 OCR サイトを開き、認識結果を貼り付けて保存します。API キー不要です。")
         self.ocr_button.clicked.connect(self.run_ocr)
         self.export_button = QPushButton("PDF出力")
         self.export_button.clicked.connect(self.export_pdf)
@@ -485,7 +543,7 @@ class MainWindow(QMainWindow):
         self.duplicate_button.setEnabled(bool(record))
         self.save_button.setEnabled(bool(record))
         self.open_source_button.setEnabled(bool(source_path and source_path.exists()))
-        self.ocr_button.setEnabled(bool(record and image_path and image_path.exists() and self._worker is None))
+        self.ocr_button.setEnabled(bool(record and image_path and image_path.exists()))
 
     def _values_from_editor(self) -> dict[str, Any]:
         old = self.loaded_record or {}
@@ -649,87 +707,50 @@ class MainWindow(QMainWindow):
 
     def run_ocr(self) -> None:
         if self.current_id is None or not self.loaded_record:
-            QMessageBox.information(self, "OCR", "先に問題を選択してください。")
-            return
-        if self._worker is not None:
-            QMessageBox.information(self, "OCR", "OCR を実行中です。")
+            QMessageBox.information(self, "無料 OCR", "先に問題を選択してください。")
             return
         image_path = self.db.resolve(self.loaded_record.get("original_path"))
         if not image_path or not image_path.exists():
-            QMessageBox.warning(self, "OCR", "原本ページ画像が見つかりません。画像または PDF を取り込んでください。")
+            QMessageBox.warning(self, "無料 OCR", "原本ページ画像が見つかりません。画像または PDF を取り込んでください。")
             return
-        if not self._cloud_warning_accepted:
-            answer = QMessageBox.warning(
-                self, "外部 OCR サービスへの送信",
-                "選択したページ画像を Mathpix API に送信します。\n個人情報や送信許可のないテストが含まれていないことを確認してください。\n\n続行しますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            self._cloud_warning_accepted = True
-        app_id, app_key = self._credentials
-        if not app_id or not app_key:
-            dialog = CredentialDialog(self, self._credentials)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            app_id, app_key = dialog.credentials()
-            if not app_id or not app_key:
-                QMessageBox.warning(self, "OCR", "App ID と App Key を入力してください。")
-                return
-            self._credentials = (app_id, app_key)
-        self.save_current()
-        question_id = self.current_id
-        self._worker = OCRWorker(question_id, image_path, app_id, app_key)
-        self._worker.succeeded.connect(self._ocr_succeeded)
-        self._worker.failed.connect(self._ocr_failed)
-        self._worker.status.connect(self.statusBar().showMessage)
-        self._worker.finished.connect(self._ocr_thread_finished)
-        self._busy = True
-        self._sync_controls()
-        self.statusBar().showMessage("Mathpix OCR を実行中…")
-        self._worker.start()
 
-    def _ocr_succeeded(self, question_id: int, result: object) -> None:
-        if not isinstance(result, dict):
+        self.save_current()
+        dialog = FreeOCRDialog(
+            self,
+            image_path,
+            existing_text=self.ocr_edit.toPlainText(),
+            question_is_empty=not bool(self.question_edit.toPlainText().strip()),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        record = self.db.get_question(question_id)
-        if not record:
+
+        recognized = dialog.recognized_text()
+        if not recognized:
+            QMessageBox.warning(self, "無料 OCR", "認識結果が空です。サイトの結果を貼り付けるか、手入力してください。")
             return
-        recognized = str(result.get("text", ""))
-        values: dict[str, Any] = {
-            "ocr_text": recognized,
-            "ocr_json": json.dumps(result, ensure_ascii=False),
-            "ocr_status": "未確認",
-        }
-        if not str(record.get("question_md", "")).strip():
+
+        question_id = self.current_id
+        values = self._values_from_editor()
+        values["ocr_text"] = recognized
+        values["ocr_json"] = json.dumps(
+            build_manual_ocr_payload(recognized, dialog.service_name()),
+            ensure_ascii=False,
+            indent=2,
+        )
+        values["ocr_status"] = "未確認"
+        copied_to_question = False
+        if dialog.copy_to_question() and recognized:
             values["question_md"] = recognized
+            copied_to_question = True
+
         self.db.save_question(question_id, values)
         self.refresh_filters()
         self.refresh_table(question_id)
         self.tabs.setCurrentIndex(3)
-        QMessageBox.information(
-            self, "OCR 完了",
-            "認識結果を保存しました。状態は「未確認」です。\n原本と照合し、数式・符号・添字・図表を確認してから「確認済み」に変更してください。\n"
-            + ("問題本文が空だったため OCR 結果を転記しました。" if "question_md" in values else "問題本文は上書きしていません。"),
-        )
-        self.statusBar().showMessage("OCR 結果を保存しました。内容を確認してください。", 6000)
-
-    def _ocr_failed(self, question_id: int, message: str) -> None:
-        record = self.db.get_question(question_id)
-        if record:
-            self.db.save_question(question_id, {"ocr_status": "要確認"})
-        self.refresh_filters()
-        self.refresh_table(question_id)
-        QMessageBox.critical(self, "OCR エラー", message)
-        self.statusBar().showMessage("OCR に失敗しました。認証情報、通信、利用制限を確認してください。", 7000)
-
-    def _ocr_thread_finished(self) -> None:
-        if self._worker is not None:
-            self._worker.deleteLater()
-        self._worker = None
-        self._busy = False
-        self._sync_controls()
+        details = "OCR 結果を保存しました。原本と照合し、数式・符号・添字・図表を確認してください。"
+        details += "\n問題本文にもコピーしました。" if copied_to_question else "\n問題本文は変更していません。"
+        QMessageBox.information(self, "OCR 結果を保存", details)
+        self.statusBar().showMessage("無料 OCR の結果を保存しました。確認後に状態を「確認済み」に変更してください。", 7000)
 
     def export_pdf(self) -> None:
         selected_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
@@ -781,9 +802,5 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self.save_current()
-        if self._worker is not None and self._worker.isRunning():
-            QMessageBox.warning(self, "処理中", "OCR が実行中です。完了してから終了してください。")
-            event.ignore()
-            return
         self.db.close()
         event.accept()

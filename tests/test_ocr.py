@@ -1,33 +1,25 @@
 from __future__ import annotations
 
-import base64
-import os
-import tempfile
 import unittest
-from pathlib import Path
 
-from PIL import Image
-
-from matharchive.ocr import _prepare_data_uri, recognize_image
+from matharchive.ocr import OCR_SITES, build_manual_ocr_payload
 
 
-class OCRPreparationTests(unittest.TestCase):
-    def test_prepares_base64_payload_below_service_limit(self) -> None:
-        # A high-entropy synthetic image exercises the resizing/compression fallback.
-        width, height = 1800, 1200
-        pixels = os.urandom(width * height * 3)
-        with tempfile.TemporaryDirectory() as temp:
-            image_path = Path(temp) / "scan.png"
-            Image.frombytes("RGB", (width, height), pixels).save(image_path)
-            data_uri = _prepare_data_uri(image_path)
-        self.assertTrue(data_uri.startswith("data:image/jpeg;base64,"))
-        encoded = data_uri.split(",", 1)[1]
-        self.assertLess(len(encoded), 2_000_000)
-        self.assertTrue(base64.b64decode(encoded).startswith(b"\xff\xd8"))
+class ManualOCRTests(unittest.TestCase):
+    def test_manual_result_is_serializable_and_marked_unverified(self) -> None:
+        result = build_manual_ocr_payload("  \\[x^2+1=0\\]  ", "Pix2Text 多言語デモ")
+        self.assertEqual(result["method"], "manual")
+        self.assertEqual(result["service"], "Pix2Text 多言語デモ")
+        self.assertEqual(result["text"], "\\[x^2+1=0\\]")
+        self.assertEqual(result["review_status"], "未確認")
 
-    def test_credentials_are_required(self) -> None:
-        with self.assertRaisesRegex(ValueError, "App ID"):
-            recognize_image("unused.png", "", "")
+    def test_empty_text_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "空です"):
+            build_manual_ocr_payload("   ", "手入力")
+
+    def test_free_web_ocr_sites_are_configured(self) -> None:
+        self.assertIn("Pix2Text 多言語デモ", OCR_SITES)
+        self.assertTrue(OCR_SITES["Pix2Text 多言語デモ"].startswith("https://"))
 
 
 if __name__ == "__main__":
